@@ -1,12 +1,13 @@
 // Rust implementation of llama grammar parser directly translated from C++ source file in vendor/llama.cpp/common/grammar-parser.cpp.
 
-use lazy_static::lazy_static;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{self};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::LazyLock;
 static LLAMA_GRAMMAR_DEFAULT_ROOT: &str = "root";
 
 struct LlamaGrammar {
@@ -233,74 +234,18 @@ item ::= "- " [^\r\n\x0b\x0c\x85\u2028\u2029]+ "\n"
 // whitespace. Also maybe improves generation quality?
 const SPACE_RULE: &str = "\" \"?";
 
-lazy_static! {
-    static ref INVALID_RULE_CHARS_RE: Regex = Regex::new(r"[^a-zA-Z0-9-]+").unwrap();
-    static ref GRAMMAR_LITERAL_ESCAPE_RE: Regex = Regex::new(r#"[\r\n"]"#).unwrap();
-    static ref GRAMMAR_LITERAL_ESCAPES: HashMap<char, &'static str> = {
-        let mut m = HashMap::new();
-        m.insert('\r', "\\r");
-        m.insert('\n', "\\n");
-        m.insert('"', "\\\"");
-        m
-    };
-}
+static INVALID_RULE_CHARS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[^a-zA-Z0-9-]+").unwrap());
 
-/*
-def _build_repetition(
-    item_rule, min_items, max_items, separator_rule=None, item_rule_is_literal=False
-):
-    if not separator_rule:
-        if min_items == 0 and max_items == 1:
-            return f"{item_rule}?"
-        elif min_items == 1 and max_items is None:
-            return f"{item_rule}+"
-
-    result = ""
-
-    if min_items > 0:
-        if item_rule_is_literal and separator_rule is None:
-            result = '"' + (item_rule[1:-1] * min_items) + '"'
-        else:
-            result = (f" {separator_rule} " if separator_rule else " ").join(
-                [item_rule] * min_items
-            )
-
-    def opt_repetitions(up_to_n, prefix_with_sep=False):
-        """
-        - n=4, no sep:             '(a (a (a (a)?)?)?)?'
-        - n=4, sep=',', prefix:    '("," a ("," a ("," a ("," a)?)?)?)?'
-        - n=4, sep=',', no prefix: '(a ("," a ("," a ("," a)?)?)?)?'
-        """
-
-        content = (
-            f"{separator_rule} {item_rule}"
-            if prefix_with_sep and separator_rule
-            else item_rule
-        )
-        if up_to_n == 0:
-            return ""
-        elif up_to_n == 1:
-            return f"({content})?"
-        elif separator_rule and not prefix_with_sep:
-            return f"({content} {opt_repetitions(up_to_n - 1, prefix_with_sep=True)})?"
-        else:
-            return (f"({content} " * up_to_n).rstrip() + (")?" * up_to_n)
-
-    if min_items > 0 and max_items != min_items:
-        result += " "
-
-    if max_items is not None:
-        result += opt_repetitions(max_items - min_items, prefix_with_sep=min_items > 0)
-    else:
-        item_operator = f'({separator_rule + " " if separator_rule else ""}{item_rule})'
-
-        if min_items == 0 and separator_rule:
-            result = f"({item_rule} {item_operator}*)?"
-        else:
-            result += f"{item_operator}*"
-
-    return result
-*/
+static GRAMMAR_LITERAL_ESCAPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[\r\n"]"#).unwrap());
+static GRAMMAR_LITERAL_ESCAPES: LazyLock<HashMap<char, &'static str>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert('\r', "\\r");
+    m.insert('\n', "\\n");
+    m.insert('"', "\\\"");
+    m
+});
 
 fn _build_repetition(
     item_rule: impl AsRef<str>,
@@ -308,12 +253,12 @@ fn _build_repetition(
     max_items: Option<i32>,
     separator_rule: Option<String>,
     item_rule_is_literal: bool,
-) -> String {
+) -> Cow<'static, str> {
     if separator_rule.is_none() {
         if min_items == 0 && max_items == Some(1) {
-            return format!("{}?", item_rule.as_ref());
+            return format!("{}?", item_rule.as_ref()).into();
         } else if min_items == 1 && max_items.is_none() {
-            return format!("{}+", item_rule.as_ref());
+            return format!("{}+", item_rule.as_ref()).into();
         }
     }
 
@@ -371,7 +316,7 @@ fn _build_repetition(
         }
     }
 
-    result
+    result.into()
 }
 
 fn opt_repititions__build_repetition(
@@ -432,136 +377,143 @@ impl BuiltinRule {
     }
 }
 
-fn _up_to_15_digits() -> String {
-    _build_repetition("[0-9]", 0, Some(15), None, false)
-}
+static _up_to_15_digits: LazyLock<String> =
+    LazyLock::new(|| _build_repetition("[0-9]", 0, Some(15), None, false).into());
 
-lazy_static! {
-    static ref PRIMITIVE_RULES: HashMap<&'static str, BuiltinRule> = {
-        let mut m = HashMap::new();
-        m.insert("boolean", BuiltinRule::new(r#"("true" | "false") space"#));
-        m.insert(
-            "decimal-part",
-            BuiltinRule::new(format!("[0-9] {}", _up_to_15_digits())),
-        );
-        m.insert(
-            "integral-part",
-            BuiltinRule::new(format!("[0-9] | [1-9] {}", _up_to_15_digits())),
-        );
-        m.insert(
-            "number",
-            BuiltinRule {
-                content:
-                    r#"("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)? space"#
-                        .to_string(),
-                deps: vec!["integral-part".to_string(), "decimal-part".to_string()],
-            },
-        );
-        m.insert(
-            "integer",
-            BuiltinRule {
-                content: r#"("-"? integral-part) space"#.to_string(),
-                deps: vec!["integral-part".to_string()],
-            },
-        );
-        m.insert(
-            "value",
-            BuiltinRule {
-                content: "object | array | string | number | boolean | null".to_string(),
-                deps: vec!["object", "array", "string", "number", "boolean", "null"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-            },
-        );
-        m.insert("object",
+static PRIMITIVE_RULES: LazyLock<HashMap<&'static str, BuiltinRule>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("boolean", BuiltinRule::new(r#"("true" | "false") space"#));
+    m.insert(
+        "decimal-part",
+        BuiltinRule::new(format!("[0-9] {}", _up_to_15_digits.clone())),
+    );
+    m.insert(
+        "integral-part",
+        BuiltinRule::new(format!("[0-9] | [1-9] {}", _up_to_15_digits.clone())),
+    );
+    m.insert(
+        "number",
         BuiltinRule {
-            content: r#""{" space ( string ":" space value ("," space string ":" space value)* )? "}" space"#.to_string(),
-            deps: vec!["string".to_string(), "value".to_string()],
-        });
-        m.insert(
-            "array",
-            BuiltinRule {
-                content: r#""[" space ( value ("," space value)* )? "]" space"#.to_string(),
-                deps: vec!["value".to_string()],
-            },
-        );
-        m.insert(
-            "uuid",
-            BuiltinRule::new(format!(
-                r#""\"" {} "\"" space"#,
-                [
-                    "[0-9a-fA-F]".repeat(8),
-                    "[0-9a-fA-F]".repeat(4),
-                    "[0-9a-fA-F]".repeat(4),
-                    "[0-9a-fA-F]".repeat(4),
-                    "[0-9a-fA-F]".repeat(12)
-                ]
-                .join(" \"-\" ")
-            )),
-        );
-        m.insert("char", BuiltinRule::new(
-            r#"[^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])"#
-        ));
-        m.insert(
-            "string",
-            BuiltinRule {
-                content: r#""\"" char* "\"" space"#.to_string(),
-                deps: vec!["char".to_string()],
-            },
-        );
-        m.insert("null", BuiltinRule::new(r#""null" space"#));
-        m
-    };
-    static ref STRING_FORMAT_RULES: HashMap<&'static str, BuiltinRule> = {
-        let mut m = HashMap::new();
-        m.insert("date", BuiltinRule::new(
-            r#"[0-9] [0-9] [0-9] [0-9] "-" ( "0" [1-9] | "1" [0-2] ) "-" ( "0" [1-9] | [1-2] [0-9] | "3" [0-1] )"#
-        ));
-        m.insert("time", BuiltinRule::new(
-            r#"([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] ":" [0-5] [0-9] ( "." [0-9] [0-9] [0-9] )? ( "Z" | ( "+" | "-" ) ( [01] [0-9] | "2" [0-3] ) ":" [0-5] [0-9] )"#
-        ));
-        m.insert(
-            "date-time",
-            BuiltinRule {
-                content: r#"date "T" time"#.to_string(),
-                deps: vec!["date".to_string(), "time".to_string()],
-            },
-        );
-        m.insert(
-            "date-string",
-            BuiltinRule {
-                content: r#""\\"" date "\\"" space"#.to_string(),
-                deps: vec!["date".to_string()],
-            },
-        );
-        m.insert(
-            "time-string",
-            BuiltinRule {
-                content: r#""\\"" time "\\"" space"#.to_string(),
-                deps: vec!["time".to_string()],
-            },
-        );
-        m.insert(
-            "date-time-string",
-            BuiltinRule {
-                content: r#""\\"" date-time "\\"" space"#.to_string(),
-                deps: vec!["date-time".to_string()],
-            },
-        );
-        m
-    };
-    static ref NON_LITERAL_SET: HashSet<char> = HashSet::from_iter("|.()[]{}*+?".chars());
-    static ref ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS: HashSet<char> =
-        HashSet::from_iter("[]()|{}*+?".chars());
-    static ref RESERVED_NAMES: HashSet<&'static str> = HashSet::from_iter(
+            content:
+                r#"("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)? space"#
+                    .to_string(),
+            deps: vec!["integral-part".to_string(), "decimal-part".to_string()],
+        },
+    );
+    m.insert(
+        "integer",
+        BuiltinRule {
+            content: r#"("-"? integral-part) space"#.to_string(),
+            deps: vec!["integral-part".to_string()],
+        },
+    );
+    m.insert(
+        "value",
+        BuiltinRule {
+            content: "object | array | string | number | boolean | null".to_string(),
+            deps: vec!["object", "array", "string", "number", "boolean", "null"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        },
+    );
+    m.insert("object",
+    BuiltinRule {
+        content: r#""{" space ( string ":" space value ("," space string ":" space value)* )? "}" space"#.to_string(),
+        deps: vec!["string".to_string(), "value".to_string()],
+    });
+    m.insert(
+        "array",
+        BuiltinRule {
+            content: r#""[" space ( value ("," space value)* )? "]" space"#.to_string(),
+            deps: vec!["value".to_string()],
+        },
+    );
+    m.insert(
+        "uuid",
+        BuiltinRule::new(format!(
+            r#""\"" {} "\"" space"#,
+            [
+                "[0-9a-fA-F]".repeat(8),
+                "[0-9a-fA-F]".repeat(4),
+                "[0-9a-fA-F]".repeat(4),
+                "[0-9a-fA-F]".repeat(4),
+                "[0-9a-fA-F]".repeat(12)
+            ]
+            .join(" \"-\" ")
+        )),
+    );
+    m.insert(
+        "char",
+        BuiltinRule::new(
+            r#"[^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])"#,
+        ),
+    );
+    m.insert(
+        "string",
+        BuiltinRule {
+            content: r#""\"" char* "\"" space"#.to_string(),
+            deps: vec!["char".to_string()],
+        },
+    );
+    m.insert("null", BuiltinRule::new(r#""null" space"#));
+    m
+});
+
+static STRING_FORMAT_RULES: LazyLock<HashMap<&'static str, BuiltinRule>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("date", BuiltinRule::new(
+                r#"[0-9] [0-9] [0-9] [0-9] "-" ( "0" [1-9] | "1" [0-2] ) "-" ( "0" [1-9] | [1-2] [0-9] | "3" [0-1] )"#
+            ));
+    m.insert("time", BuiltinRule::new(
+                r#"([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] ":" [0-5] [0-9] ( "." [0-9] [0-9] [0-9] )? ( "Z" | ( "+" | "-" ) ( [01] [0-9] | "2" [0-3] ) ":" [0-5] [0-9] )"#
+            ));
+    m.insert(
+        "date-time",
+        BuiltinRule {
+            content: r#"date "T" time"#.to_string(),
+            deps: vec!["date".to_string(), "time".to_string()],
+        },
+    );
+    m.insert(
+        "date-string",
+        BuiltinRule {
+            content: r#""\\"" date "\\"" space"#.to_string(),
+            deps: vec!["date".to_string()],
+        },
+    );
+    m.insert(
+        "time-string",
+        BuiltinRule {
+            content: r#""\\"" time "\\"" space"#.to_string(),
+            deps: vec!["time".to_string()],
+        },
+    );
+    m.insert(
+        "date-time-string",
+        BuiltinRule {
+            content: r#""\\"" date-time "\\"" space"#.to_string(),
+            deps: vec!["date-time".to_string()],
+        },
+    );
+    m
+});
+
+static NON_LITERAL_SET: LazyLock<HashSet<char>> =
+    LazyLock::new(|| HashSet::from_iter("|.()[]{}*+?".chars()));
+
+static ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS: LazyLock<HashSet<char>> =
+    LazyLock::new(|| HashSet::from_iter("[]()|{}*+?".chars()));
+
+static RESERVED_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from_iter(
         ["root", "dot"]
             .iter()
             .chain(PRIMITIVE_RULES.keys())
             .chain(STRING_FORMAT_RULES.keys())
-            .cloned()
-    );
-}
+            .cloned(),
+    )
+});
 
 const DOTALL: &str = "[\\U00000000-\\U0010FFFF]";
 const DOT: &str = "[^\\x0A\\x0D]";
@@ -622,7 +574,7 @@ impl SchemaConverter {
         }
     }
 
-    fn _format_literal(literal: &str) -> String {
+    fn _format_literal(literal: &str) -> Cow<str> {
         /*
         escaped = GRAMMAR_LITERAL_ESCAPE_RE.sub(
             lambda m: GRAMMAR_LITERAL_ESCAPES.get(m.group(0)), literal
@@ -634,7 +586,7 @@ impl SchemaConverter {
                 .get(&caps.get(0).unwrap().as_str().chars().next().unwrap())
                 .unwrap()
         });
-        format!("\"{}\"", escaped)
+        format!("\"{}\"", escaped).into()
     }
 
     // NOT USED IN PYTHON CODE
@@ -665,26 +617,26 @@ impl SchemaConverter {
     //     }
     // }
 
-    fn _add_rule(&mut self, name: &str, rule: &str) -> String {
+    fn _add_rule(&mut self, name: &str, rule: &str) -> Cow<str> {
         let esc_name = INVALID_RULE_CHARS_RE.replace_all(name, "_").to_string();
 
-        let key;
-        if !self.rules.contains_key(&esc_name) || self.rules.get(&esc_name).unwrap() == rule {
-            key = esc_name;
-        } else {
-            let mut i = 1;
-            while self
-                .rules
-                .contains_key(format!("{}{}", esc_name, i).as_str())
-                && self.rules[format!("{}{}", esc_name, i).as_str()] != rule
-            {
-                i += 1;
-            }
-            key = format!("{}{}", esc_name, i);
-        }
+        let key =
+            if !self.rules.contains_key(&esc_name) || self.rules.get(&esc_name).unwrap() == rule {
+                esc_name
+            } else {
+                let mut i = 1;
+                while self
+                    .rules
+                    .contains_key(format!("{}{}", esc_name, i).as_str())
+                    && self.rules[format!("{}{}", esc_name, i).as_str()] != rule
+                {
+                    i += 1;
+                }
+                format!("{}{}", esc_name, i)
+            };
         self.rules.remove(&key);
         self.rules.insert(key.clone(), rule.to_string());
-        key
+        key.into()
     }
 
     fn resolve_refs(&mut self, mut schema: Value, url: &str) -> Option<Value> {
@@ -694,17 +646,17 @@ impl SchemaConverter {
         respective referenced (sub)schema dictionaries.
         */
         let schema_clone = schema.clone();
-        self.visit_resolve_refs(&mut schema, schema_clone, url)
+        self.visit_resolve_refs(&mut schema, &schema_clone, url)
     }
 
-    fn visit_resolve_refs(&mut self, n: &mut Value, schema: Value, url: &str) -> Option<Value> {
+    fn visit_resolve_refs(&mut self, n: &mut Value, schema: &Value, url: &str) -> Option<Value> {
         if n.is_array() {
             return Some(Value::Array(
                 n.clone()
                     .as_array_mut()
                     .unwrap()
                     .iter_mut()
-                    .map(|v| self.visit_resolve_refs(v, schema.clone(), url).unwrap())
+                    .map(|v| self.visit_resolve_refs(v, schema, url).unwrap())
                     .collect(),
             ));
         } else if n.is_object() {
@@ -762,7 +714,7 @@ impl SchemaConverter {
                 return None;
             } else if let Some(obj) = n.as_object_mut() {
                 for v in obj.values_mut() {
-                    self.visit_resolve_refs(v, schema.clone(), url);
+                    self.visit_resolve_refs(v, schema, url);
                 }
             }
         }
@@ -817,7 +769,7 @@ impl SchemaConverter {
         let i = 0;
         let length = pattern.as_str().len();
 
-        let rule = {
+        let rule: String = {
             let pattern = self.transform__visit_pattern(
                 pattern,
                 name.to_string(),
@@ -826,7 +778,7 @@ impl SchemaConverter {
                 &mut sub_rule_ids,
             );
             if self.raw_pattern {
-                self.to_rule__visit_pattern(pattern)
+                self.to_rule__visit_pattern(pattern).into()
             } else {
                 format!(
                     //  '"\\"" ' + to_rule(transform()) + ' "\\"" space'
@@ -835,15 +787,15 @@ impl SchemaConverter {
                 )
             }
         };
-        self._add_rule(name, &rule)
+        self._add_rule(name, &rule).into()
     }
 
-    fn to_rule__visit_pattern(&mut self, s: (String, bool)) -> String {
+    fn to_rule__visit_pattern(&self, s: (String, bool)) -> Cow<str> {
         let (txt, is_literal) = s;
         if is_literal {
-            format!("\"{}\"", txt)
+            format!("\"{}\"", txt).into()
         } else {
-            txt
+            txt.into()
         }
     }
 
@@ -862,7 +814,7 @@ impl SchemaConverter {
         while i < length {
             let c = pattern_chars[i];
             if c == '.' {
-                seq.push((self.get_dot__transform__visit_pattern(), false));
+                seq.push((self.get_dot__transform__visit_pattern().into(), false));
                 i += 1;
             } else if c == '(' {
                 i += 1;
@@ -975,8 +927,8 @@ impl SchemaConverter {
                         None => {
                             let new_id = self
                                 ._add_rule(&format!("{}-{}", name, sub_rule_ids.len() + 1), &sub);
-                            sub_rule_ids.insert(sub.clone(), new_id.clone());
-                            new_id
+                            sub_rule_ids.insert(sub.clone(), new_id.clone().into());
+                            new_id.into()
                         }
                     };
                     sub = id;
@@ -994,7 +946,8 @@ impl SchemaConverter {
                         max_times,
                         None,
                         sub_is_literal,
-                    ),
+                    )
+                    .into(),
                     false,
                 );
             } else {
@@ -1037,13 +990,9 @@ impl SchemaConverter {
         self.join_seq__transform__visit_pattern(seq)
     }
 
-    fn get_dot__transform__visit_pattern(&mut self) -> String {
-        let rule = if self.dotall {
-            DOTALL.to_string()
-        } else {
-            DOT.to_string()
-        };
-        self._add_rule("dot", &rule)
+    fn get_dot__transform__visit_pattern(&mut self) -> Cow<str> {
+        let rule = if self.dotall { DOTALL } else { DOT };
+        self._add_rule("dot", rule)
     }
 
     fn join_seq__transform__visit_pattern(&mut self, seq: Vec<(String, bool)>) -> (String, bool) {
@@ -1066,7 +1015,7 @@ impl SchemaConverter {
         } else {
             (
                 seq.iter()
-                    .map(|x| self.to_rule__visit_pattern(x.clone()))
+                    .map(|x| self.to_rule__visit_pattern(x.clone()).into())
                     .collect::<Vec<String>>()
                     .join(" "),
                 false,
@@ -1086,7 +1035,7 @@ impl SchemaConverter {
     }
 
     fn _generate_constant_rule(&mut self, value: &Value) -> String {
-        Self::_format_literal(&value.to_string())
+        Self::_format_literal(&value.to_string()).to_string()
     }
 
     fn visit(&mut self, schema: Value, name: Option<String>) -> String {
@@ -1107,12 +1056,12 @@ impl SchemaConverter {
         if schema.get("$ref").is_some() {
             let refv = schema.get("$ref").unwrap();
             let rule = &self._resolve_ref(refv.as_str().unwrap());
-            self._add_rule(&rule_name, rule)
+            self._add_rule(&rule_name, rule).into()
         } else if schema.get("oneOf").is_some() || schema.get("anyOf").is_some() {
             let alt_schema = schema.get("oneOf").unwrap_or(schema.get("anyOf").unwrap());
             let rule =
                 self._generate_union_rule(name.clone().unwrap().as_str(), vec![alt_schema.clone()]);
-            return self._add_rule(&rule_name, &rule);
+            return self._add_rule(&rule_name, &rule).into();
         } else if schema_type.is_some_and(|t| t.is_array()) {
             let alt_schemas = schema_type
                 .unwrap()
@@ -1122,10 +1071,10 @@ impl SchemaConverter {
                 .map(|t| json!({"type": t}))
                 .collect::<Vec<_>>();
             let rule = self._generate_union_rule(name.clone().unwrap().as_str(), alt_schemas);
-            return self._add_rule(&rule_name, &rule);
+            return self._add_rule(&rule_name, &rule).into();
         } else if schema.get("const").is_some() {
             let rule = self._generate_constant_rule(schema.get("const").unwrap());
-            return self._add_rule(&rule_name, &rule);
+            return self._add_rule(&rule_name, &rule).into();
         } else if schema.get("enum").is_some() {
             let rule = schema
                 .get("enum")
@@ -1136,12 +1085,13 @@ impl SchemaConverter {
                 .map(|v| self._generate_constant_rule(v))
                 .collect::<Vec<_>>()
                 .join(" | ");
-            return self._add_rule(&rule_name, &rule);
-        } else if schema_type.is_none_or(|t| t.as_str().unwrap() == "object")
-            && (schema.get("properties").is_some()
-                || schema
-                    .get("additionalProperties")
-                    .is_some_and(|v| !v.as_bool().unwrap()))
+            return self._add_rule(&rule_name, &rule).into();
+        } else if schema_type.is_none()
+            || schema_type.is_some_and(|t| t.as_str().unwrap() == "object")
+                && (schema.get("properties").is_some()
+                    || schema
+                        .get("additionalProperties")
+                        .is_some_and(|v| !v.as_bool().unwrap()))
         {
             let required = schema
                 .get("required")
@@ -1165,9 +1115,10 @@ impl SchemaConverter {
                 name,
                 schema.get("additionalProperties"),
             );
-            return self._add_rule(&rule_name, &rule);
-        } else if schema_type.is_none_or(|t| t.as_str().unwrap() == "object")
-            && schema.get("allOf").is_some()
+            return self._add_rule(&rule_name, &rule).into();
+        } else if schema_type.is_none()
+            || schema_type.is_some_and(|t| t.as_str().unwrap() == "object")
+                && schema.get("allOf").is_some()
         {
             let mut required = HashSet::new();
             let mut properties = vec![];
@@ -1194,9 +1145,10 @@ impl SchemaConverter {
                 hybrid_name,
                 Some(&json!(Vec::<Vec<String>>::new())),
             );
-            return self._add_rule(&rule_name, &rule);
-        } else if schema_type.is_none_or(|t| t.as_str().unwrap() == "array")
-            && (schema.get("items").is_some() || schema.get("prefixItems").is_some())
+            return self._add_rule(&rule_name, &rule).into();
+        } else if schema_type.is_none()
+            || schema_type.is_some_and(|t| t.as_str().unwrap() == "array")
+                && (schema.get("items").is_some() || schema.get("prefixItems").is_some())
         {
             let items = {
                 if schema.get("items").is_some() {
@@ -1227,7 +1179,7 @@ impl SchemaConverter {
                     })
                     .collect::<Vec<_>>();
                 let rule = format!("\"[\" space {} \"]\" space", rule.join(" \",\" space "));
-                return self._add_rule(&rule_name, &rule);
+                return self._add_rule(&rule_name, &rule).into();
             } else {
                 let item_rule_name = self.visit(
                     items.clone(),
@@ -1260,26 +1212,28 @@ impl SchemaConverter {
                     false,
                 );
                 let rule = format!("\"[\" space {} \"]\" space", rep);
-                return self._add_rule(&rule_name, &rule);
+                return self._add_rule(&rule_name, &rule).into();
             }
-        } else if schema_type.is_none_or(|t| t.as_str().unwrap() == "string")
-            && schema.get("pattern").is_some()
+        } else if schema_type.is_none()
+            || schema_type.is_some_and(|t| t.as_str().unwrap() == "string")
+                && schema.get("pattern").is_some()
         {
             return self._visit_pattern(
                 Regex::new(schema.get("pattern").unwrap().as_str().unwrap()).unwrap(),
                 &rule_name,
             );
-        } else if schema_type.is_none_or(|t| t.as_str().unwrap() == "string")
-            && regex::Regex::new(r"^uuid[1-5]?$")
-                .unwrap()
-                .is_match(schema_format.unwrap_or(&json!("")).as_str().unwrap())
+        } else if schema_type.is_none()
+            || schema_type.is_some_and(|t| t.as_str().unwrap() == "string")
+                && regex::Regex::new(r"^uuid[1-5]?$")
+                    .unwrap()
+                    .is_match(schema_format.unwrap_or(&json!("")).as_str().unwrap())
         {
             let prim_name = format!("{}-string", schema_format.unwrap().as_str().unwrap());
             let rule = self._add_primitive(
                 &prim_name,
                 STRING_FORMAT_RULES.get(prim_name.as_str()).unwrap().clone(),
             );
-            return self._add_rule(&rule_name, &rule);
+            return self._add_rule(&rule_name, &rule).into();
         } else if schema_type.is_some_and(|t| t.as_str().unwrap() == "string")
             && (schema.get("minLength").is_some() || schema.get("maxLength").is_some())
         {
@@ -1300,10 +1254,12 @@ impl SchemaConverter {
                 "\"\\\"\" {} \"\\\"\" space",
                 _build_repetition(char_rule, min_len, max_len, None, false)
             );
-            return self._add_rule(&rule_name, &rule);
-        } else if schema_type.is_none_or(|t| t.as_str().unwrap() == "object") {
+            return self._add_rule(&rule_name, &rule).into();
+        } else if schema_type.is_none()
+            || schema_type.is_some_and(|t| t.as_str().unwrap() == "object")
+        {
             let primitive = self._add_primitive("object", PRIMITIVE_RULES["object"].clone());
-            return self._add_rule(&rule_name, &primitive);
+            return self._add_rule(&rule_name, &primitive).into();
         } else {
             assert!(PRIMITIVE_RULES.contains_key(schema_type.unwrap().as_str().unwrap()));
             // TODO: support minimum, maximum, exclusiveMinimum, exclusiveMaximum at least for zero
@@ -1347,7 +1303,7 @@ impl SchemaConverter {
     }
 
     fn _add_primitive(&mut self, name: &str, rule: BuiltinRule) -> String {
-        let n = self._add_rule(name, &rule.content);
+        let n = self._add_rule(name, &rule.content).into();
 
         for dep in rule.deps {
             let dep = dep.as_str();
@@ -1398,7 +1354,7 @@ impl SchemaConverter {
                 .collect::<Vec<_>>()
         };
 
-        let mut prop_kv_rule_names = HashMap::new();
+        let mut prop_kv_rule_names: HashMap<String, String> = HashMap::new();
         for (prop_name, prop_schema) in properties {
             let prop_rule_name = self.visit(
                 prop_schema,
@@ -1430,7 +1386,8 @@ impl SchemaConverter {
                         prop_name
                     ),
                     rule,
-                ),
+                )
+                .into(),
             );
         }
         let required_props = sorted_props
@@ -1470,7 +1427,7 @@ impl SchemaConverter {
             );
             prop_kv_rule_names.insert(
                 "*".to_string(),
-                self._add_rule(&format!("{}-kv", sub_name), &rule),
+                self._add_rule(&format!("{}-kv", sub_name), &rule).into(),
             );
             optional_props.push("*".to_string());
         }
@@ -1492,10 +1449,11 @@ impl SchemaConverter {
 
             let rule_refs = (0..optional_props.len())
                 .map(|i| {
-                    Self::get_recursive_refs__build_object_rule(
+                    self.get_recursive_refs__build_object_rule(
                         optional_props[i..].to_vec(),
                         false,
                         &mut prop_kv_rule_names,
+                        name.clone(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1512,12 +1470,76 @@ impl SchemaConverter {
         rule
     }
 
+    /*
+    def get_recursive_refs(ks, first_is_optional):
+        [k, *rest] = ks
+        kv_rule_name = prop_kv_rule_names[k]
+        if k == "*":
+            res = self._add_rule(
+                f'{name}{"-" if name else ""}additional-kvs',
+                f'{kv_rule_name} ( "," space ' + kv_rule_name + " )*",
+            )
+        elif first_is_optional:
+            res = f'( "," space {kv_rule_name} )?'
+        else:
+            res = kv_rule_name
+        if len(rest) > 0:
+            res += " " + self._add_rule(
+                f'{name}{"-" if name else ""}{k}-rest',
+                get_recursive_refs(rest, first_is_optional=True),
+            )
+        return res
+    */
+
     fn get_recursive_refs__build_object_rule(
+        &mut self,
         ks: Vec<String>,
         first_is_optional: bool,
         prop_kv_rule_names: &mut HashMap<String, String>,
+        name: Option<String>,
     ) -> String {
-        "".to_string()
+        let (k, rest) = ks.split_first().unwrap();
+        let kv_rule_name = prop_kv_rule_names.get(k).unwrap().clone();
+        let mut res = if k == "*" {
+            self._add_rule(
+                &format!(
+                    "{}additional-kvs",
+                    if name.is_some() {
+                        name.clone().unwrap() + "-"
+                    } else {
+                        "".to_string()
+                    },
+                ),
+                &format!("{} ( \",\" space {} )*", kv_rule_name, kv_rule_name),
+            )
+            .into()
+        } else if first_is_optional {
+            format!("( \",\" space {} )?", kv_rule_name)
+        } else {
+            kv_rule_name.clone()
+        };
+        if rest.len() > 0 {
+            let rule = self.get_recursive_refs__build_object_rule(
+                rest.to_vec(),
+                true,
+                prop_kv_rule_names,
+                name.clone(),
+            );
+            let rest_rule = self._add_rule(
+                &format!(
+                    "{}{}-rest",
+                    if name.is_some() {
+                        name.unwrap() + "-"
+                    } else {
+                        "".to_string()
+                    },
+                    k
+                ),
+                &rule,
+            );
+            res = format!("{} {}", res, rest_rule)
+        }
+        res
     }
 
     fn format_grammar(&self) -> String {

@@ -1,6 +1,7 @@
 use either::Either;
 use mistralrs_core::{ImageGenerationResponseFormat, Tool, ToolChoice};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{collections::HashMap, ops::Deref};
 use utoipa::ToSchema;
 
@@ -76,6 +77,15 @@ pub enum Grammar {
     Yacc(String),
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+
+pub struct JsonResponseFormat {
+    #[serde(rename = "type")]
+    _type: String,
+    #[serde(alias = "schema", alias = "json_schema")]
+    schema: Value,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ChatCompletionRequest {
     #[schema(example = json!(vec![Message{content:"Why did the crab cross the road?".to_string(), role:"user".to_string(), name: None}]))]
@@ -114,6 +124,8 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<Tool>>,
     #[schema(example = json!(Option::None::<ToolChoice>))]
     pub tool_choice: Option<ToolChoice>,
+    #[schema(example = json!(Option::None::<JsonResponseFormat>))]
+    pub response_format: Option<JsonResponseFormat>,
 
     // mistral.rs additional
     #[schema(example = json!(Option::None::<usize>))]
